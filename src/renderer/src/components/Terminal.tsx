@@ -217,7 +217,7 @@ function Terminal(): React.JSX.Element | null {
         })
       }
 
-      const closed = await waitForFileClosed(120_000)
+      const closed = await waitForFileClosed(10_000)
       if (!closed) {
         toast.error('Save timed out or failed. Fix errors before closing.')
         setSaveDialogFileId(fileId)
@@ -251,11 +251,15 @@ function Terminal(): React.JSX.Element | null {
     const pendingWindowClose = windowCloseAfterDirtyRef.current
 
     if (pendingWindowClose) {
-      setSaveDialogFileId(null)
       // Why: autosave runs on a background timer. Wait for any pending/in-flight
       // write to settle before honoring "Don't Save", otherwise the file can be
       // written after the user explicitly chose to discard their edits.
-      await requestEditorSaveQuiesce({ fileId })
+      try {
+        await requestEditorSaveQuiesce({ fileId })
+      } catch {
+        // Quiesce failed — proceed with discard anyway so the user isn't stuck.
+      }
+      setSaveDialogFileId(null)
       markFileDirty(fileId, false)
       closeFile(fileId)
 
@@ -808,6 +812,13 @@ function Terminal(): React.JSX.Element | null {
     return window.api.ui.onWindowCloseRequested(({ isQuitting }) => {
       if (isUpdaterQuitAndInstallInProgress()) {
         window.api.ui.confirmWindowClose()
+        return
+      }
+
+      // Why: if a previous close request is already being handled (user is
+      // working through dirty-file dialogs), ignore duplicate quit signals
+      // to avoid overwriting the in-flight ref and losing the close sequence.
+      if (windowCloseAfterDirtyRef.current) {
         return
       }
 
