@@ -17,6 +17,7 @@ import { createUntitledMarkdownFile } from '../../lib/create-untitled-markdown'
 import { getConnectionId } from '../../lib/connection-context'
 import { extractIpcErrorMessage } from '../../lib/ipc-error'
 import { destroyPersistentWebview } from '../browser-pane/BrowserPane'
+import { requestEditorFileClose } from '../editor/editor-autosave'
 
 export type GroupEditorItem = OpenFile & { tabId: string }
 export type GroupBrowserItem = BrowserTabState & { tabId: string }
@@ -164,8 +165,17 @@ export function useTabGroupWorkspaceModel({
             item.contentType === 'conflict-review')
       )
       if (!otherReference) {
+        const file = useAppStore.getState().openFiles.find((candidate) => candidate.id === entityId)
+        if (file?.isDirty) {
+          // Why: split-group close actions bypass Terminal.tsx, but the unsaved
+          // confirmation + save/discard ordering must stay centralized there so
+          // tab close, bulk close, and window quit share one queueing flow.
+          requestEditorFileClose(entityId)
+          return false
+        }
         closeFile(entityId)
       }
+      return true
     },
     [closeFile, worktreeId]
   )
@@ -198,7 +208,10 @@ export function useTabGroupWorkspaceModel({
         destroyPersistentWebview(item.entityId)
         closeBrowserTab(item.entityId)
       } else {
-        closeEditorIfUnreferenced(item.entityId, item.id)
+        const canCloseTab = closeEditorIfUnreferenced(item.entityId, item.id)
+        if (!canCloseTab) {
+          return
+        }
         closeUnifiedTab(item.id)
       }
       if (!opts?.skipEmptyCheck) {
@@ -228,11 +241,14 @@ export function useTabGroupWorkspaceModel({
           destroyPersistentWebview(item.entityId)
           closeBrowserTab(item.entityId)
         } else {
-          closeEditorIfUnreferenced(item.entityId, item.id)
+          const canCloseTab = closeEditorIfUnreferenced(item.entityId, item.id)
+          if (canCloseTab) {
+            closeUnifiedTab(item.id)
+          }
         }
       }
     },
-    [closeBrowserTab, closeEditorIfUnreferenced, closeTab, groupTabs]
+    [closeBrowserTab, closeEditorIfUnreferenced, closeTab, closeUnifiedTab, groupTabs]
   )
 
   const activateTerminal = useCallback(

@@ -22,8 +22,10 @@ import { Button } from '@/components/ui/button'
 import TabBar from './tab-bar/TabBar'
 import TerminalPane from './terminal-pane/TerminalPane'
 import {
+  ORCA_EDITOR_REQUEST_FILE_CLOSE_EVENT,
   ORCA_EDITOR_SAVE_AND_CLOSE_EVENT,
   ORCA_EDITOR_REQUEST_CMD_SAVE_EVENT,
+  type EditorRequestFileCloseDetail,
   requestEditorSaveQuiesce
 } from './editor/editor-autosave'
 import { isUpdaterQuitAndInstallInProgress } from '@/lib/updater-beforeunload'
@@ -38,9 +40,11 @@ import {
   getEffectiveLayoutForWorktree as getEffectiveLayout,
   anyMountedWorktreeHasLayout as computeAnyMountedWorktreeHasLayout
 } from './terminal/split-group-mount'
+import { appendUniqueOpenFileIds, buildUnsavedDiffModelKey } from './terminal/unsaved-close-queue'
 import CodexRestartChip from './CodexRestartChip'
 
 const EditorPanel = lazy(() => import('./editor/EditorPanel'))
+const DiffViewer = lazy(() => import('./editor/DiffViewer'))
 
 function Terminal(): React.JSX.Element | null {
   const allWorktrees = useAllWorktrees()
@@ -65,7 +69,6 @@ function Terminal(): React.JSX.Element | null {
   const setActiveFile = useAppStore((s) => s.setActiveFile)
   const openFile = useAppStore((s) => s.openFile)
   const closeFile = useAppStore((s) => s.closeFile)
-  const closeAllFiles = useAppStore((s) => s.closeAllFiles)
   const pinFile = useAppStore((s) => s.pinFile)
   const browserTabsByWorktree = useAppStore((s) => s.browserTabsByWorktree)
   const createBrowserTab = useAppStore((s) => s.createBrowserTab)
@@ -135,6 +138,18 @@ function Terminal(): React.JSX.Element | null {
   // Save confirmation dialog state
   const [saveDialogFileId, setSaveDialogFileId] = useState<string | null>(null)
   const saveDialogFile = saveDialogFileId ? openFiles.find((f) => f.id === saveDialogFileId) : null
+  const [unsavedDiffDialogOpen, setUnsavedDiffDialogOpen] = useState(false)
+  const [unsavedDiffLoading, setUnsavedDiffLoading] = useState(false)
+  const [unsavedDiffError, setUnsavedDiffError] = useState<string | null>(null)
+  const [unsavedDiffModelKey, setUnsavedDiffModelKey] = useState<string | null>(null)
+  const [unsavedDiffModel, setUnsavedDiffModel] = useState<{
+    fileLabel: string
+    language: string
+    originalContent: string
+    modifiedContent: string
+  } | null>(null)
+  const unsavedDiffRequestIdRef = useRef(0)
+  const pendingEditorCloseQueueRef = useRef<string[]>([])
 
   // Window close confirmation dialog — shown when the user tries to close the
   // window (X button, Cmd+Q) while terminals with running processes exist.
@@ -173,16 +188,88 @@ function Terminal(): React.JSX.Element | null {
     )
   }, [])
 
+  const waitForFileClosed = useCallback((fileId: string, timeoutMs: number): Promise<boolean> => {
+    if (!useAppStore.getState().openFiles.some((f) => f.id === fileId)) {
+      return Promise.resolve(true)
+    }
+    return new Promise((resolve) => {
+      let unsub: (() => void) | null = null
+      const timeoutId = window.setTimeout(() => {
+        unsub?.()
+        resolve(false)
+      }, timeoutMs)
+      unsub = useAppStore.subscribe((state) => {
+        if (!state.openFiles.some((f) => f.id === fileId)) {
+          window.clearTimeout(timeoutId)
+          unsub?.()
+          resolve(true)
+        }
+      })
+    })
+  }, [])
+
+  const getNextQueuedEditorClose = useCallback((): string | null => {
+    // Why: bulk close actions can enqueue files that become clean or disappear
+    // before they reach the front. Drain those entries eagerly so the dialog
+    // only blocks on tabs that still require an explicit close decision.
+    while (pendingEditorCloseQueueRef.current.length > 0) {
+      const fileId = pendingEditorCloseQueueRef.current[0]
+      const file = useAppStore.getState().openFiles.find((candidate) => candidate.id === fileId)
+      if (!file) {
+        pendingEditorCloseQueueRef.current.shift()
+        continue
+      }
+      if (!file.isDirty) {
+        closeFile(fileId)
+        pendingEditorCloseQueueRef.current.shift()
+        continue
+      }
+      return fileId
+    }
+    return null
+  }, [closeFile])
+
+  const advanceEditorCloseQueue = useCallback(() => {
+    const nextFileId = getNextQueuedEditorClose()
+    if (nextFileId) {
+      setActiveFile(nextFileId)
+      setActiveTabType('editor')
+      setSaveDialogFileId(nextFileId)
+      return
+    }
+    setSaveDialogFileId(null)
+    const pendingWindowClose = windowCloseAfterDirtyRef.current
+    if (pendingWindowClose) {
+      windowCloseAfterDirtyRef.current = null
+      proceedToNativeWindowClose(pendingWindowClose.isQuitting)
+    }
+  }, [getNextQueuedEditorClose, proceedToNativeWindowClose, setActiveFile, setActiveTabType])
+
+  const queueEditorCloseRequests = useCallback(
+    (fileIds: string[], pendingWindowClose?: { isQuitting: boolean }) => {
+      if (pendingWindowClose) {
+        windowCloseAfterDirtyRef.current = pendingWindowClose
+      }
+      pendingEditorCloseQueueRef.current = appendUniqueOpenFileIds(
+        pendingEditorCloseQueueRef.current,
+        fileIds,
+        new Set(useAppStore.getState().openFiles.map((file) => file.id))
+      )
+      advanceEditorCloseQueue()
+    },
+    [advanceEditorCloseQueue]
+  )
+
   const handleCloseFile = useCallback(
     (fileId: string) => {
       const file = useAppStore.getState().openFiles.find((f) => f.id === fileId)
       if (file?.isDirty) {
-        setSaveDialogFileId(fileId)
+        queueEditorCloseRequests([fileId])
         return
       }
       closeFile(fileId)
     },
-    [closeFile]
+    [closeFile, queueEditorCloseRequests]
   )
 
   const handleSaveDialogSave = useCallback(async () => {
@@ -190,59 +277,12 @@ function Terminal(): React.JSX.Element | null {
       return
     }
     const fileId = saveDialogFileId
-    const pendingWindowClose = windowCloseAfterDirtyRef.current
     const file = useAppStore.getState().openFiles.find((f) => f.id === fileId)
     if (!file) {
-      setSaveDialogFileId(null)
-      windowCloseAfterDirtyRef.current = null
-      return
-    }
-
-    if (pendingWindowClose) {
-      setSaveDialogFileId(null)
-      // Why: save-and-close must flush the latest draft even when the visible
-      // editor panel has already unmounted. The headless autosave controller
-      // owns that write path now, so the dialog signals it through a custom
-      // event instead of poking at editor component refs.
-      window.dispatchEvent(
-        new CustomEvent(ORCA_EDITOR_SAVE_AND_CLOSE_EVENT, { detail: { fileId } })
+      pendingEditorCloseQueueRef.current = pendingEditorCloseQueueRef.current.filter(
+        (id) => id !== fileId
       )
-
-      const waitForFileClosed = (timeoutMs: number): Promise<boolean> => {
-        if (!useAppStore.getState().openFiles.some((f) => f.id === fileId)) {
-          return Promise.resolve(true)
-        }
-        return new Promise((resolve) => {
-          let unsub: (() => void) | null = null
-          const timeoutId = window.setTimeout(() => {
-            unsub?.()
-            resolve(false)
-          }, timeoutMs)
-          unsub = useAppStore.subscribe((state) => {
-            if (!state.openFiles.some((f) => f.id === fileId)) {
-              window.clearTimeout(timeoutId)
-              unsub?.()
-              resolve(true)
-            }
-          })
-        })
-      }
-
-      const closed = await waitForFileClosed(10_000)
-      if (!closed) {
-        toast.error('Save timed out or failed. Fix errors before closing.')
-        setSaveDialogFileId(fileId)
-        return
-      }
-
-      const nextDirty = useAppStore.getState().openFiles.filter((f) => f.isDirty)
-      if (nextDirty.length > 0) {
-        setSaveDialogFileId(nextDirty[0].id)
-      } else {
-        const { isQuitting } = pendingWindowClose
-        windowCloseAfterDirtyRef.current = null
-        proceedToNativeWindowClose(isQuitting)
-      }
+      advanceEditorCloseQueue()
       return
     }
 
@@ -250,54 +290,134 @@ function Terminal(): React.JSX.Element | null {
     // editor panel has already unmounted. The headless autosave controller
     // owns that write path now, so the dialog signals it through a custom
     // event instead of poking at editor component refs.
-    window.dispatchEvent(new CustomEvent(ORCA_EDITOR_SAVE_AND_CLOSE_EVENT, { detail: { fileId } }))
     setSaveDialogFileId(null)
-  }, [saveDialogFileId, proceedToNativeWindowClose])
+    setUnsavedDiffDialogOpen(false)
+    window.dispatchEvent(new CustomEvent(ORCA_EDITOR_SAVE_AND_CLOSE_EVENT, { detail: { fileId } }))
+    const closed = await waitForFileClosed(fileId, 10_000)
+    if (!closed) {
+      toast.error('Save timed out or failed. Fix errors before closing.')
+      setSaveDialogFileId(fileId)
+      return
+    }
+    pendingEditorCloseQueueRef.current = pendingEditorCloseQueueRef.current.filter(
+      (id) => id !== fileId
+    )
+    advanceEditorCloseQueue()
+  }, [advanceEditorCloseQueue, saveDialogFileId, waitForFileClosed])
 
   const handleSaveDialogDiscard = useCallback(async () => {
     if (!saveDialogFileId) {
       return
     }
     const fileId = saveDialogFileId
-    const pendingWindowClose = windowCloseAfterDirtyRef.current
-
-    if (pendingWindowClose) {
-      // Why: autosave runs on a background timer. Wait for any pending/in-flight
-      // write to settle before honoring "Don't Save", otherwise the file can be
-      // written after the user explicitly chose to discard their edits.
-      try {
-        await requestEditorSaveQuiesce({ fileId })
-      } catch {
-        // Quiesce failed — proceed with discard anyway so the user isn't stuck.
-      }
-      setSaveDialogFileId(null)
-      markFileDirty(fileId, false)
-      closeFile(fileId)
-
-      const nextDirty = useAppStore.getState().openFiles.filter((f) => f.isDirty)
-      if (nextDirty.length > 0) {
-        setSaveDialogFileId(nextDirty[0].id)
-      } else {
-        const { isQuitting } = pendingWindowClose
-        windowCloseAfterDirtyRef.current = null
-        proceedToNativeWindowClose(isQuitting)
-      }
-      return
-    }
 
     // Why: autosave runs on a background timer. Wait for any pending/in-flight
     // write to settle before honoring "Don't Save", otherwise the file can be
     // written after the user explicitly chose to discard their edits.
-    await requestEditorSaveQuiesce({ fileId })
+    try {
+      await requestEditorSaveQuiesce({ fileId })
+    } catch {
+      // Quiesce failure must not trap the user in a close dialog loop.
+    }
     markFileDirty(fileId, false)
     closeFile(fileId)
-    setSaveDialogFileId(null)
-  }, [saveDialogFileId, closeFile, markFileDirty, proceedToNativeWindowClose])
+    setUnsavedDiffDialogOpen(false)
+    pendingEditorCloseQueueRef.current = pendingEditorCloseQueueRef.current.filter(
+      (id) => id !== fileId
+    )
+    advanceEditorCloseQueue()
+  }, [advanceEditorCloseQueue, closeFile, markFileDirty, saveDialogFileId])
 
   const handleSaveDialogCancel = useCallback(() => {
+    pendingEditorCloseQueueRef.current = []
     windowCloseAfterDirtyRef.current = null
+    setUnsavedDiffDialogOpen(false)
+    setUnsavedDiffError(null)
+    setUnsavedDiffModelKey(null)
+    setUnsavedDiffModel(null)
+    setUnsavedDiffLoading(false)
     setSaveDialogFileId(null)
   }, [])
+
+  const handleSaveDialogViewDiff = useCallback(async () => {
+    if (!saveDialogFileId) {
+      return
+    }
+    const file = useAppStore
+      .getState()
+      .openFiles.find((candidate) => candidate.id === saveDialogFileId)
+    if (!file) {
+      return
+    }
+
+    const requestId = ++unsavedDiffRequestIdRef.current
+    setUnsavedDiffModelKey(buildUnsavedDiffModelKey(file.id, requestId))
+    setUnsavedDiffDialogOpen(true)
+    setUnsavedDiffLoading(true)
+    setUnsavedDiffError(null)
+
+    let originalContent = ''
+    if (!file.isUntitled) {
+      try {
+        const connectionId = getConnectionId(file.worktreeId) ?? undefined
+        const saved = await window.api.fs.readFile({ filePath: file.filePath, connectionId })
+        if (saved.isBinary) {
+          if (requestId !== unsavedDiffRequestIdRef.current) {
+            return
+          }
+          setUnsavedDiffModel(null)
+          setUnsavedDiffModelKey(null)
+          setUnsavedDiffLoading(false)
+          setUnsavedDiffError('Diff is unavailable for binary files.')
+          return
+        }
+        originalContent = saved.content
+      } catch (error) {
+        if (requestId !== unsavedDiffRequestIdRef.current) {
+          return
+        }
+        setUnsavedDiffModel(null)
+        setUnsavedDiffModelKey(null)
+        setUnsavedDiffLoading(false)
+        setUnsavedDiffError(
+          `Failed to load saved file: ${extractIpcErrorMessage(error, 'Unable to read file')}`
+        )
+        return
+      }
+    }
+
+    const modifiedContent = useAppStore.getState().editorDrafts[file.id] ?? originalContent
+    if (requestId !== unsavedDiffRequestIdRef.current) {
+      return
+    }
+    setUnsavedDiffModel({
+      fileLabel: file.relativePath.split('/').pop() ?? file.relativePath,
+      language: file.language,
+      originalContent,
+      modifiedContent
+    })
+    setUnsavedDiffLoading(false)
+  }, [saveDialogFileId])
+
+  useEffect(() => {
+    const onRequestEditorClose = (event: Event): void => {
+      const customEvent = event as CustomEvent<EditorRequestFileCloseDetail>
+      const fileId = customEvent.detail?.fileId
+      if (!fileId) {
+        return
+      }
+      queueEditorCloseRequests([fileId])
+    }
+    window.addEventListener(
+      ORCA_EDITOR_REQUEST_FILE_CLOSE_EVENT,
+      onRequestEditorClose as EventListener
+    )
+    return () =>
+      window.removeEventListener(
+        ORCA_EDITOR_REQUEST_FILE_CLOSE_EVENT,
+        onRequestEditorClose as EventListener
+      )
+  }, [queueEditorCloseRequests])
 
   useEffect(() => {
     if (tabs.length === 0) {
@@ -584,6 +704,7 @@ function Terminal(): React.JSX.Element | null {
       }
       const state = useAppStore.getState()
       const order = state.tabBarOrderByWorktree[activeWorktreeId] ?? []
+      const dirtyFileIds: string[] = []
       for (const id of order) {
         if (id === tabId) {
           continue
@@ -593,10 +714,9 @@ function Terminal(): React.JSX.Element | null {
         } else if (
           state.openFiles.some((file) => file.worktreeId === activeWorktreeId && file.id === id)
         ) {
-          if (
-            state.activeFileId === id &&
-            state.openFiles.find((file) => file.id === id)?.isDirty
-          ) {
+          const file = state.openFiles.find((candidate) => candidate.id === id)
+          if (file?.isDirty) {
+            dirtyFileIds.push(id)
             continue
           }
           closeFile(id)
@@ -607,8 +727,11 @@ function Terminal(): React.JSX.Element | null {
           closeBrowserTab(id)
         }
       }
+      if (dirtyFileIds.length > 0) {
+        queueEditorCloseRequests(dirtyFileIds)
+      }
     },
-    [activeWorktreeId, closeBrowserTab, closeFile, closeTab]
+    [activeWorktreeId, closeBrowserTab, closeFile, closeTab, queueEditorCloseRequests]
   )
 
   const handleCloseTabsToRight = useCallback(
@@ -623,12 +746,18 @@ function Terminal(): React.JSX.Element | null {
         return
       }
       const rightIds = currentOrder.slice(index + 1)
+      const dirtyFileIds: string[] = []
       for (const id of rightIds) {
         if ((state.tabsByWorktree[activeWorktreeId] ?? []).some((tab) => tab.id === id)) {
           closeTab(id)
         } else if (
           state.openFiles.some((file) => file.worktreeId === activeWorktreeId && file.id === id)
         ) {
+          const file = state.openFiles.find((candidate) => candidate.id === id)
+          if (file?.isDirty) {
+            dirtyFileIds.push(id)
+            continue
+          }
           closeFile(id)
         } else if (
           (state.browserTabsByWorktree[activeWorktreeId] ?? []).some((tab) => tab.id === id)
@@ -637,9 +766,29 @@ function Terminal(): React.JSX.Element | null {
           closeBrowserTab(id)
         }
       }
+      if (dirtyFileIds.length > 0) {
+        queueEditorCloseRequests(dirtyFileIds)
+      }
     },
-    [activeWorktreeId, closeBrowserTab, closeFile, closeTab]
+    [activeWorktreeId, closeBrowserTab, closeFile, closeTab, queueEditorCloseRequests]
   )
+
+  const handleCloseAllFiles = useCallback(() => {
+    if (!activeWorktreeId) {
+      return
+    }
+    const state = useAppStore.getState()
+    const filesInWorktree = state.openFiles.filter((file) => file.worktreeId === activeWorktreeId)
+    const dirtyFileIds = filesInWorktree.filter((file) => file.isDirty).map((file) => file.id)
+    for (const file of filesInWorktree) {
+      if (!file.isDirty) {
+        closeFile(file.id)
+      }
+    }
+    if (dirtyFileIds.length > 0) {
+      queueEditorCloseRequests(dirtyFileIds)
+    }
+  }, [activeWorktreeId, closeFile, queueEditorCloseRequests])
 
   const handleActivateTab = useCallback(
     (tabId: string) => {
@@ -861,8 +1010,10 @@ function Terminal(): React.JSX.Element | null {
 
       const dirtyFiles = useAppStore.getState().openFiles.filter((f) => f.isDirty)
       if (dirtyFiles.length > 0) {
-        windowCloseAfterDirtyRef.current = { isQuitting }
-        setSaveDialogFileId(dirtyFiles[0].id)
+        queueEditorCloseRequests(
+          dirtyFiles.map((file) => file.id),
+          { isQuitting }
+        )
         return
       }
 
@@ -895,7 +1046,7 @@ function Terminal(): React.JSX.Element | null {
         }
       )
     })
-  }, [])
+  }, [queueEditorCloseRequests])
 
   // Why: removeWorktree cleans up browser tab state in the store but cannot
   // call destroyPersistentWebview (renderer-only DOM code). This subscriber
@@ -998,7 +1149,7 @@ function Terminal(): React.JSX.Element | null {
             onActivateBrowserTab={handleActivateBrowserTab}
             onCloseBrowserTab={handleCloseBrowserTab}
             onDuplicateBrowserTab={handleDuplicateBrowserTab}
-            onCloseAllFiles={closeAllFiles}
+            onCloseAllFiles={handleCloseAllFiles}
             onPinFile={pinFile}
             tabBarOrder={tabBarOrder}
           />,
@@ -1170,9 +1321,9 @@ function Terminal(): React.JSX.Element | null {
 
       {/* Save confirmation dialog */}
       <Dialog
-        open={saveDialogFileId !== null}
+        open={saveDialogFileId !== null && !unsavedDiffDialogOpen}
         onOpenChange={(open) => {
-          if (!open) {
+          if (!open && !unsavedDiffDialogOpen) {
             handleSaveDialogCancel()
           }
         }}
@@ -1189,6 +1340,82 @@ function Terminal(): React.JSX.Element | null {
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" size="sm" onClick={handleSaveDialogCancel}>
               Cancel
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={handleSaveDialogViewDiff}>
+              View Diff
+            </Button>
+            <Button type="button" variant="outline" size="sm" onClick={handleSaveDialogDiscard}>
+              Don&apos;t Save
+            </Button>
+            <Button type="button" size="sm" onClick={handleSaveDialogSave}>
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={unsavedDiffDialogOpen}
+        onOpenChange={(open) => {
+          setUnsavedDiffDialogOpen(open)
+        }}
+      >
+        <DialogContent className="top-0 right-0 bottom-0 left-0 m-auto translate-x-0 translate-y-0 w-[calc(100vw-1rem)] max-w-[calc(100vw-1rem)] h-[calc(100vh-4rem)] flex flex-col p-4">
+          <DialogHeader>
+            <DialogTitle className="text-sm">
+              Unsaved Diff{unsavedDiffModel ? ` - ${unsavedDiffModel.fileLabel}` : ''}
+            </DialogTitle>
+            <DialogDescription className="text-xs">
+              Compare your current unsaved draft with the saved file on disk.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="min-h-0 flex-1 overflow-hidden rounded-md border border-border/60">
+            {unsavedDiffLoading ? (
+              <div className="h-full flex items-center justify-center text-xs text-muted-foreground">
+                Loading diff...
+              </div>
+            ) : unsavedDiffError ? (
+              <div className="h-full flex items-center justify-center px-4 text-xs text-destructive">
+                {unsavedDiffError}
+              </div>
+            ) : unsavedDiffModel ? (
+              <Suspense
+                fallback={
+                  <div className="h-full flex items-center justify-center text-xs text-muted-foreground">
+                    Loading diff view...
+                  </div>
+                }
+              >
+                <div className="h-full min-h-0 flex flex-col">
+                  <DiffViewer
+                    key={unsavedDiffModelKey ?? `unsaved-close:${unsavedDiffModel.fileLabel}`}
+                    modelKey={unsavedDiffModelKey ?? `unsaved-close:${unsavedDiffModel.fileLabel}`}
+                    originalContent={unsavedDiffModel.originalContent}
+                    modifiedContent={unsavedDiffModel.modifiedContent}
+                    language={unsavedDiffModel.language}
+                    filePath={saveDialogFile?.filePath ?? ''}
+                    relativePath={saveDialogFile?.relativePath ?? unsavedDiffModel.fileLabel}
+                    // Why: the unsaved-close modal is transient and space-constrained.
+                    // Inline diff keeps one wide code column so long lines remain readable.
+                    sideBySide={false}
+                    editable={false}
+                  />
+                </div>
+              </Suspense>
+            ) : (
+              <div className="h-full flex items-center justify-center text-xs text-muted-foreground">
+                No diff available.
+              </div>
+            )}
+          </div>
+          <DialogFooter className="mt-4 gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => setUnsavedDiffDialogOpen(false)}
+            >
+              Back
             </Button>
             <Button type="button" variant="outline" size="sm" onClick={handleSaveDialogDiscard}>
               Don&apos;t Save
